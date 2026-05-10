@@ -3,12 +3,18 @@ import uuid
 import json
 import subprocess
 from typing import Optional
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from datetime import datetime, timedelta, timezone
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Header
 from fastapi.staticfiles import StaticFiles
 import edge_tts
 from azure.ai.inference import ChatCompletionsClient
 from azure.ai.inference.models import SystemMessage, UserMessage, AssistantMessage
 from azure.core.credentials import AzureKeyCredential
+from motor.motor_asyncio import AsyncIOMotorClient
+from passlib.context import CryptContext
+from jose import jwt, JWTError
+from pydantic import BaseModel
 
 # =====================================================
 # App & Base Config
@@ -58,6 +64,111 @@ azure_client = ChatCompletionsClient(
     endpoint=AZURE_ENDPOINT,
     credential=AzureKeyCredential(AZURE_TOKEN),
 )
+
+# =====================================================
+# MongoDB Config
+# =====================================================
+MONGODB_URI = os.environ["MONGODB_URI"]
+JWT_SECRET = os.environ.get("JWT_SECRET", "change-this-to-a-long-random-secret")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_HOURS = 24
+
+mongo_client = AsyncIOMotorClient(MONGODB_URI)
+db = mongo_client["eva_db"]
+users_col = db["users"]
+blacklist_col = db["token_blacklist"]
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+# =====================================================
+# Auth Models
+# =====================================================
+class SignUpRequest(BaseModel):
+    email: str
+    name: str
+    device_id: str
+    password: str
+
+
+class SignInRequest(BaseModel):
+    email: str
+    password: str
+
+
+# =====================================================
+# Auth Helpers
+# =====================================================
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+
+def create_token(user_id: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS)
+    return jwt.encode({"sub": user_id, "exp": expire}, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+# =====================================================
+# Startup: create DB indexes
+# =====================================================
+@app.on_event("startup")
+async def startup():
+    await users_col.create_index("email", unique=True)
+    # blacklist tokens auto-expire after JWT lifetime
+    await blacklist_col.create_index(
+        "created_at", expireAfterSeconds=JWT_EXPIRE_HOURS * 3600
+    )
+
+
+# =====================================================
+# Auth Endpoints
+# =====================================================
+@app.post("/auth/signup")
+async def signup(data: SignUpRequest):
+    existing = await users_col.find_one({"email": data.email})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    user = {
+        "email": data.email,
+        "name": data.name,
+        "device_id": data.device_id,
+        "password": hash_password(data.password),
+        "created_at": datetime.now(timezone.utc),
+    }
+    result = await users_col.insert_one(user)
+    token = create_token(str(result.inserted_id))
+    return {"message": "Account created", "token": token, "name": data.name}
+
+
+@app.post("/auth/signin")
+async def signin(data: SignInRequest):
+    user = await users_col.find_one({"email": data.email})
+    if not user or not verify_password(data.password, user["password"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    token = create_token(str(user["_id"]))
+    return {"message": "Signed in", "token": token, "name": user["name"]}
+
+
+@app.post("/auth/signout")
+async def signout(authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+
+    token = authorization.split(" ", 1)[1]
+    try:
+        jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    await blacklist_col.insert_one({"token": token, "created_at": datetime.now(timezone.utc)})
+    return {"message": "Signed out successfully"}
+
 
 # =====================================================
 # TTS Config
